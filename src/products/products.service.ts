@@ -24,6 +24,8 @@ export class ProductsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ProductsService.name);
   private existFlag = false;
   private redis: Redis;
+  private readonly productCacheTTL = 300;
+  private readonly productListCacheTTL = 180;
 
   constructor(
     private readonly httpService: WooCommerceHttpService,
@@ -215,44 +217,92 @@ export class ProductsService implements OnModuleInit, OnModuleDestroy {
       return viewMap;
     }
   }
+  private async getFromCache<T>(key: string): Promise<T | null> {
+    try {
+      if (!this.redis) {
+        return null;
+      }
+      const value = await this.redis.get(key);
+      if (!value) {
+        return null;
+      }
+      return JSON.parse(value) as T;
+    } catch (error) {
+      this.logger.error(`Failed to get cache for key ${key}:`, error);
+      return null;
+    }
+  }
+
+  private async setCache(key: string, value: any, ttlSeconds: number): Promise<void> {
+    try {
+      if (!this.redis) {
+        return;
+      }
+      const payload = JSON.stringify(value);
+      if (ttlSeconds > 0) {
+        await this.redis.set(key, payload, 'EX', ttlSeconds);
+      } else {
+        await this.redis.set(key, payload);
+      }
+    } catch (error) {
+      this.logger.error(`Failed to set cache for key ${key}:`, error);
+    }
+  }
+
+  private buildProductsCacheKey(
+    params: string,
+    perPage: number,
+    page: number,
+    language?: string,
+  ): string {
+    const lang = language || 'en';
+    return `products:list:${lang}:p${page}:pp${perPage}:${params}`;
+  }
 
   async getProduct(id: string, token: string, language?: string) {
     try {
-      let response = await this.httpService.get(`/products/${id}`);
-      const { data: variations } = await this.httpService.get(
-        `/products/${id}/variations`,
-        undefined,
-        true,
-        'V3',
-      );
+      const cacheKey = `product:details:${id}:${language || 'en'}`;
+      let productData = await this.getFromCache<any>(cacheKey);
 
-      if (variations && Array.isArray(variations)) {
-        response.data['variations'] = variations.map((v) => ({
-          id: v.id,
-          attributes:
-            v.attributes?.map((attr) => ({
-              name: attr.name,
-              option: attr.option,
-            })) || [],
-          image: v.image?.src || null,
-          price: this.safeParse(v.price) * 5 || null,
-          regular_price: this.safeParse(v.regular_price) * 5 || null,
-          sale_price: this.safeParse(v.sale_price) * 5 || null,
-          stock_quantity: v.stock_quantity ?? null,
-          stock_status: v.stock_status || null,
-        }));
+      if (!productData) {
+        let response = await this.httpService.get(`/products/${id}`);
+        const { data: variations } = await this.httpService.get(
+          `/products/${id}/variations`,
+          undefined,
+          true,
+          'V3',
+        );
+
+        if (variations && Array.isArray(variations)) {
+          response.data['variations'] = variations.map((v) => ({
+            id: v.id,
+            attributes:
+              v.attributes?.map((attr) => ({
+                name: attr.name,
+                option: attr.option,
+              })) || [],
+            image: v.image?.src || null,
+            price: this.safeParse(v.price) * 5 || null,
+            regular_price: this.safeParse(v.regular_price) * 5 || null,
+            sale_price: this.safeParse(v.sale_price) * 5 || null,
+            stock_quantity: v.stock_quantity ?? null,
+            stock_status: v.stock_status || null,
+          }));
+        }
+
+        productData = this.transformProductPrices(response.data);
+
+        if (language && language !== 'en') {
+          productData = await this.translationService.translateProduct(
+            productData,
+            language,
+          );
+        }
+
+        await this.setCache(cacheKey, productData, this.productCacheTTL);
       }
-
-      let productData = this.transformProductPrices(response.data);
 
       const viewCount = await this.recordProductView(id);
-
-      if (language && language !== 'en') {
-        productData = await this.translationService.translateProduct(
-          productData,
-          language,
-        );
-      }
 
       this.logger.log(`Product #${id} details fetched successfully`);
 
@@ -286,8 +336,8 @@ export class ProductsService implements OnModuleInit, OnModuleDestroy {
         cart,
         isPurchased,
         viewCount,
-        reviewsCount: productData.rating_count || 0,
-        averageRating: parseFloat(productData.average_rating || '0'),
+        reviewsCount: productData?.rating_count || 0,
+        averageRating: parseFloat(productData?.average_rating || '0'),
         language: language || 'en',
         ...(this.existFlag
           ? {}
@@ -312,49 +362,55 @@ export class ProductsService implements OnModuleInit, OnModuleDestroy {
 
   async getProduct_Sync(id: string, language?: string) {
     try {
-      let response = await this.httpService.get(`/products/${id}`);
-      const { data: variations } = await this.httpService.get(
-        `/products/${id}/variations`,
-        undefined,
-        true,
-        'V3',
-      );
+      const cacheKey = `product:details:${id}:${language || 'en'}`;
+      let productData = await this.getFromCache<any>(cacheKey);
 
-      if (variations && Array.isArray(variations)) {
-        response.data['variations'] = variations.map((v) => ({
-          id: v.id,
-          attributes:
-            v.attributes?.map((attr) => ({
-              name: attr.name,
-              option: attr.option,
-            })) || [],
-          image: v.image?.src || null,
-          price: this.safeParse(v.price) * 5 || null,
-          regular_price: this.safeParse(v.regular_price) * 5 || null,
-          sale_price: this.safeParse(v.sale_price) * 5 || null,
-          stock_quantity: v.stock_quantity ?? null,
-          stock_status: v.stock_status || null,
-        }));
+      if (!productData) {
+        let response = await this.httpService.get(`/products/${id}`);
+        const { data: variations } = await this.httpService.get(
+          `/products/${id}/variations`,
+          undefined,
+          true,
+          'V3',
+        );
+
+        if (variations && Array.isArray(variations)) {
+          response.data['variations'] = variations.map((v) => ({
+            id: v.id,
+            attributes:
+              v.attributes?.map((attr) => ({
+                name: attr.name,
+                option: attr.option,
+              })) || [],
+            image: v.image?.src || null,
+            price: this.safeParse(v.price) * 5 || null,
+            regular_price: this.safeParse(v.regular_price) * 5 || null,
+            sale_price: this.safeParse(v.sale_price) * 5 || null,
+            stock_quantity: v.stock_quantity ?? null,
+            stock_status: v.stock_status || null,
+          }));
+        }
+
+        productData = this.transformProductPrices(response.data);
+
+        if (language && language !== 'en') {
+          productData = await this.translationService.translateProduct(
+            productData,
+            language,
+          );
+        }
+
+        await this.setCache(cacheKey, productData, this.productCacheTTL);
       }
-
-      let productData = this.transformProductPrices(response.data);
 
       const viewCount = await this.getProductViewCount(id);
-
-      if (language && language !== 'en') {
-        productData = await this.translationService.translateProduct(
-          productData,
-          language,
-        );
-      }
 
       this.logger.log(`Product #${id} details fetched successfully`);
       return {
         ...productData,
         viewCount,
-        reviewsCount: productData.rating_count || 0,
-        averageRating: parseFloat(productData.average_rating || '0'),
-
+        reviewsCount: productData?.rating_count || 0,
+        averageRating: parseFloat(productData?.average_rating || '0'),
         language: language || 'en',
       };
     } catch (error) {
@@ -396,15 +452,26 @@ export class ProductsService implements OnModuleInit, OnModuleDestroy {
         params.append('search', searchTerm);
       }
 
-      const fetchProducts = async (perPage: number, page: number) => {
+      const perPage = parseInt(query.per_page ?? '10');
+      const currentPage = parseInt(query.page ?? '1');
+
+      const cacheKey = this.buildProductsCacheKey(
+        params.toString(),
+        perPage,
+        currentPage,
+        language,
+      );
+      const cached = await this.getFromCache<any>(cacheKey);
+      if (cached) {
+        return cached;
+      }
+
+      const fetchProducts = async (perPageValue: number, page: number) => {
         const response = await this.httpService.get(
-          `/products?${params.toString()}&per_page=${perPage}&page=${page}`,
+          `/products?${params.toString()}&per_page=${perPageValue}&page=${page}`,
         );
         return response;
       };
-
-      const perPage = parseInt(query.per_page ?? '10');
-      const currentPage = parseInt(query.page ?? '1');
 
       let response = await fetchProducts(perPage, currentPage);
       let originalProducts = response.data;
@@ -475,7 +542,7 @@ export class ProductsService implements OnModuleInit, OnModuleDestroy {
         );
       }
 
-      return {
+      const result = {
         products: modifiedProducts,
         pagination: {
           total: parseInt(response.headers['x-wp-total']) || 0,
@@ -485,6 +552,10 @@ export class ProductsService implements OnModuleInit, OnModuleDestroy {
         },
         language: language || 'en',
       };
+
+      await this.setCache(cacheKey, result, this.productListCacheTTL);
+
+      return result;
     } catch (error) {
       this.logger.error(`Error fetching products: ${error?.message}`);
       throw new HttpException(

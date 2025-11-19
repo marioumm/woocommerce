@@ -2,9 +2,10 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
 /* eslint-disable @typescript-eslint/no-unsafe-return */
-import { Injectable, Logger, HttpException, HttpStatus, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, HttpException, HttpStatus, NotFoundException, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { WooCommerceHttpService } from '../shared/woocommerce-http.service';
 import { TranslationService } from './translation.service';
+import Redis from 'ioredis';
 
 export interface CategoryWithSubcategories {
   id: number;
@@ -20,26 +21,100 @@ export interface CategoryWithSubcategories {
 }
 
 @Injectable()
-export class CategoriesService {
+export class CategoriesService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(CategoriesService.name);
+  private redis: Redis;
+  private readonly categoryCacheTTL = 600;
 
   constructor(
     private readonly httpService: WooCommerceHttpService,
     private readonly translationService: TranslationService,
   ) {}
 
+  async onModuleInit() {
+    try {
+      this.redis = new Redis({
+        host: process.env.REDIS_HOST || 'localhost',
+        port: Number(process.env.REDIS_PORT) || 6379,
+        password: process.env.REDIS_PASSWORD || undefined,
+        retryStrategy: (times) => {
+          const delay = Math.min(times * 50, 2000);
+          return delay;
+        },
+      });
+
+      this.redis.on('connect', () => {
+        this.logger.log('Redis connected for categories');
+      });
+
+      this.redis.on('error', (err) => {
+        this.logger.error('Redis connection error for categories:', err);
+      });
+    } catch (error) {
+      this.logger.error('Failed to initialize Redis for categories:', error);
+    }
+  }
+
+  async onModuleDestroy() {
+    if (this.redis) {
+      await this.redis.quit();
+      this.logger.log('Redis connection for categories closed');
+    }
+  }
+
+  private async getFromCache<T>(key: string): Promise<T | null> {
+    try {
+      if (!this.redis) {
+        return null;
+      }
+      const value = await this.redis.get(key);
+      if (!value) {
+        return null;
+      }
+      return JSON.parse(value) as T;
+    } catch (error) {
+      this.logger.error(`Failed to get cache for key ${key}:`, error);
+      return null;
+    }
+  }
+
+  private async setCache(key: string, value: any, ttlSeconds: number): Promise<void> {
+    try {
+      if (!this.redis) {
+        return;
+      }
+      const payload = JSON.stringify(value);
+      if (ttlSeconds > 0) {
+        await this.redis.set(key, payload, 'EX', ttlSeconds);
+      } else {
+        await this.redis.set(key, payload);
+      }
+    } catch (error) {
+      this.logger.error(`Failed to set cache for key ${key}:`, error);
+    }
+  }
+
   async getMainCategories(lang?: string): Promise<CategoryWithSubcategories[]> {
     try {
+      const cacheKey = `categories:main:${lang || 'en'}`;
+      const cached = await this.getFromCache<CategoryWithSubcategories[]>(cacheKey);
+      if (cached) {
+        return cached;
+      }
+
       const response = await this.httpService.get('/products/categories');
       const mainCategories = response.data.filter(
         (cat: any) => cat.parent === 0
       );
 
-      if (!lang || lang === 'en') {
-        return mainCategories;
+      let result: CategoryWithSubcategories[] | any[] = mainCategories;
+
+      if (lang && lang !== 'en') {
+        result = await this.translateCategories(mainCategories, lang);
       }
 
-      return await this.translateCategories(mainCategories, lang);
+      await this.setCache(cacheKey, result, this.categoryCacheTTL);
+      return result as CategoryWithSubcategories[];
     } catch (error) {
       this.logger.error('Error fetching main categories:', error.message);
       throw new HttpException(
@@ -64,14 +139,23 @@ export class CategoriesService {
 
   async getCategories(lang?: string) {
     try {
+      const cacheKey = `categories:all:${lang || 'en'}`;
+      const cached = await this.getFromCache<any[]>(cacheKey);
+      if (cached) {
+        return cached;
+      }
+
       const response = await this.httpService.get('/products/categories');
       const categories = response.data;
 
-      if (!lang || lang === 'en') {
-        return categories;
+      let result: any[] = categories;
+
+      if (lang && lang !== 'en') {
+        result = await this.translateCategories(categories, lang);
       }
 
-      return await this.translateCategories(categories, lang);
+      await this.setCache(cacheKey, result, this.categoryCacheTTL);
+      return result;
     } catch (error) {
       this.logger.error('Error fetching categories:', error.message);
       throw new HttpException(
@@ -86,6 +170,12 @@ export class CategoriesService {
     lang?: string,
   ): Promise<CategoryWithSubcategories> {
     try {
+      const cacheKey = `categories:with-subs:${categoryId}:${lang || 'en'}`;
+      const cached = await this.getFromCache<CategoryWithSubcategories>(cacheKey);
+      if (cached) {
+        return cached;
+      }
+
       const categoryResponse = await this.httpService.get(`/products/categories/${categoryId}`);
       const category = categoryResponse.data;
 
@@ -105,11 +195,14 @@ export class CategoriesService {
         subcategories: subcategories || []
       };
 
-      if (!lang || lang === 'en') {
-        return categoryWithSubs;
+      let result: CategoryWithSubcategories = categoryWithSubs;
+
+      if (lang && lang !== 'en') {
+        result = await this.translateCategoryWithSubcategories(categoryWithSubs, lang);
       }
 
-      return await this.translateCategoryWithSubcategories(categoryWithSubs, lang);
+      await this.setCache(cacheKey, result, this.categoryCacheTTL);
+      return result;
     } catch (error) {
       this.logger.error(`Error fetching category ${categoryId}:`, error.message);
 
@@ -126,14 +219,23 @@ export class CategoriesService {
 
   async getProductTags(lang?: string) {
     try {
+      const cacheKey = `categories:tags:${lang || 'en'}`;
+      const cached = await this.getFromCache<any[]>(cacheKey);
+      if (cached) {
+        return cached;
+      }
+
       const response = await this.httpService.get('/products/tags');
       const tags = response.data;
 
-      if (!lang || lang === 'en') {
-        return tags;
+      let result: any[] = tags;
+
+      if (lang && lang !== 'en') {
+        result = await this.translateTags(tags, lang);
       }
 
-      return await this.translateTags(tags, lang);
+      await this.setCache(cacheKey, result, this.categoryCacheTTL);
+      return result;
     } catch (error) {
       this.logger.error('Error fetching product tags:', error.message);
       throw new HttpException(
@@ -145,14 +247,23 @@ export class CategoriesService {
 
   async getProductBrands(lang?: string) {
     try {
+      const cacheKey = `categories:brands:${lang || 'en'}`;
+      const cached = await this.getFromCache<any[]>(cacheKey);
+      if (cached) {
+        return cached;
+      }
+
       const response = await this.httpService.get('/products/brands');
       const brands = response.data;
 
-      if (!lang || lang === 'en') {
-        return brands;
+      let result: any[] = brands;
+
+      if (lang && lang !== 'en') {
+        result = await this.translateBrands(brands, lang);
       }
 
-      return await this.translateBrands(brands, lang);
+      await this.setCache(cacheKey, result, this.categoryCacheTTL);
+      return result;
     } catch (error) {
       this.logger.error('Error fetching product brands:', error.message);
       throw new HttpException(
