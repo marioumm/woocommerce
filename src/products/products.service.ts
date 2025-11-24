@@ -26,6 +26,9 @@ export class ProductsService implements OnModuleInit, OnModuleDestroy {
   private redis: Redis;
   private readonly productCacheTTL = 300;
   private readonly productListCacheTTL = 180;
+  private readonly customerCacheTTL = 3600 * 24; // 1 day
+  private readonly userServiceBaseUrl =
+    process.env.USER_SERVICE_BASE_URL || 'https://api-gateway.camion-app.com';
 
   constructor(
     private readonly httpService: WooCommerceHttpService,
@@ -80,7 +83,7 @@ export class ProductsService implements OnModuleInit, OnModuleDestroy {
     productId: string,
     headers: Record<string, string>,
   ): Promise<boolean> {
-    const url = `https://api-gateway.camion-app.com/${type}/check-product`;
+    const url = `${this.userServiceBaseUrl}/${type}/check-product`;
     try {
       const response: AxiosResponse<{ exists: boolean }> = await axios.post(
         url,
@@ -106,15 +109,56 @@ export class ProductsService implements OnModuleInit, OnModuleDestroy {
     customerEmail: string,
   ): Promise<boolean> {
     try {
-      const response = await this.httpService.get(
-        `/orders?customer=${customerEmail}&status=completed`,
+      // Try to get customer ID from cache first
+      const customerCacheKey = `customer:email:${customerEmail}`;
+      let customerId: number | null = null;
+
+      const cachedCustomerId = await this.redis.get(customerCacheKey);
+      if (cachedCustomerId) {
+        customerId = parseInt(cachedCustomerId, 10);
+        this.logger.debug(
+          `Customer ID for ${customerEmail} retrieved from cache`,
+        );
+      } else {
+        // Fetch customer ID from WooCommerce API
+        const customerResponse = await this.httpService.get(
+          `/customers?email=${encodeURIComponent(customerEmail)}`,
+          undefined,
+          true,
+          'V3',
+        );
+
+        if (!customerResponse.data || customerResponse.data.length === 0) {
+          return false;
+        }
+
+        customerId = customerResponse.data[0]?.id;
+        if (!customerId) {
+          return false;
+        }
+
+        // Cache the customer ID
+        await this.redis.setex(
+          customerCacheKey,
+          this.customerCacheTTL,
+          customerId.toString(),
+        );
+        this.logger.debug(`Customer ID for ${customerEmail} cached`);
+      }
+
+      // Now query orders with customer ID
+      const ordersResponse = await this.httpService.get(
+        `/orders?customer=${customerId}&status=completed`,
+        undefined,
+        true,
+        'V3',
       );
 
-      if (!response.data || response.data.length === 0) {
+      if (!ordersResponse.data || ordersResponse.data.length === 0) {
         return false;
       }
 
-      const purchased = response.data.some((order: any) =>
+      const purchased = ordersResponse.data.some((order: any) =>
         order.line_items?.some(
           (item: any) => String(item.product_id) === String(productId),
         ),
@@ -233,7 +277,11 @@ export class ProductsService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async setCache(key: string, value: any, ttlSeconds: number): Promise<void> {
+  private async setCache(
+    key: string,
+    value: any,
+    ttlSeconds: number,
+  ): Promise<void> {
     try {
       if (!this.redis) {
         return;
@@ -314,8 +362,10 @@ export class ProductsService implements OnModuleInit, OnModuleDestroy {
       let customerEmail = '';
       try {
         const userResponse = await axios.get(
-          'https://api-gateway.camion-app.com/users/me',
-          { headers: authHeaders },
+          `${this.userServiceBaseUrl}/users/me`,
+          {
+            headers: authHeaders,
+          },
         );
         customerEmail = userResponse.data?.email || '';
       } catch (err) {
